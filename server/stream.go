@@ -283,7 +283,7 @@ type BatchFlowAck struct {
 	// CurrentSequence is the sequence of the message that triggered the ack
 	CurrentSequence uint64 `json:"seq,omitempty"`
 	// AckMessages indicates the active per-message frequency of Flow Acks
-	AckMessages int `json:"messages,omitempty"`
+	AckMessages uint64 `json:"messages,omitempty"`
 	// AckBytes indicates the active per-bytes frequency of Flow Acks in unit of bytes
 	AckBytes int64 `json:"bytes,omitempty"`
 }
@@ -576,6 +576,7 @@ const (
 	JSBatchCommit             = "Nats-Batch-Commit"
 	JSFastBatchId             = "Nats-Fast-Batch-Id"
 	JSBatchGap                = "Nats-Batch-Gap"
+	JSFlow                    = "Nats-Flow"
 	JSSchedulePattern         = "Nats-Schedule"
 	JSScheduleTTL             = "Nats-Schedule-TTL"
 	JSScheduleTarget          = "Nats-Schedule-Target"
@@ -6075,12 +6076,17 @@ func (mset *stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, 
 		if batchId != _EMPTY_ && !batchAtomic && mset.batches != nil {
 			batches := mset.batches
 			batches.mu.Lock()
-			commitReply := batches.registerStreamSeq(batchId, batchSeq, mset.lseq)
-			batches.mu.Unlock()
+			b, commitReply := batches.registerStreamSeq(batchId, batchSeq, mset.lseq)
 			if commitReply != _EMPTY_ {
 				reply = commitReply
 				canRespond = doAck && len(reply) > 0 && isLeader
+			} else if canRespond && b != nil {
+				// If not committing, we need to send a flow control message instead.
+				canRespond = false
+				response, _ = json.Marshal(&BatchFlowAck{AckMessages: b.ackMessages, CurrentSequence: batchSeq})
+				outq.sendMsg(reply, response)
 			}
+			batches.mu.Unlock()
 		}
 		if canRespond {
 			response = append(pubAck, strconv.FormatUint(mset.lseq, 10)...)
@@ -6263,12 +6269,17 @@ func (mset *stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, 
 	if batchId != _EMPTY_ && !batchAtomic && mset.batches != nil {
 		batches := mset.batches
 		batches.mu.Lock()
-		commitReply := batches.registerStreamSeq(batchId, batchSeq, seq)
-		batches.mu.Unlock()
+		b, commitReply := batches.registerStreamSeq(batchId, batchSeq, mset.lseq)
 		if commitReply != _EMPTY_ {
 			reply = commitReply
 			canRespond = doAck && len(reply) > 0 && isLeader
+		} else if canRespond && b != nil {
+			// If not committing, we need to send a flow control message instead.
+			canRespond = false
+			response, _ = json.Marshal(&BatchFlowAck{AckMessages: b.ackMessages, CurrentSequence: batchSeq})
+			outq.sendMsg(reply, response)
 		}
+		batches.mu.Unlock()
 	}
 
 	// Send response here.
@@ -6454,7 +6465,11 @@ func (mset *stream) processJetStreamBatchMsg(batchId string, atomic bool, subjec
 
 		var err error
 		gapOk := bytesToString(sliceHeader(JSBatchGap, hdr)) == JSFastBatchGapOk
-		if b, err = batches.newBatchGroup(mset, batchId, atomic, gapOk); err != nil {
+		ackMessages := uint64(10)
+		if flow := sliceHeader(JSFlow, hdr); flow != nil {
+			ackMessages = uint64(parseInt64(flow))
+		}
+		if b, err = batches.newBatchGroup(mset, batchId, atomic, gapOk, ackMessages); err != nil {
 			globalInflightBatches.Add(-1)
 			batches.mu.Unlock()
 			return respondIncompleteBatch()
@@ -6488,18 +6503,20 @@ func (mset *stream) processJetStreamBatchMsg(batchId string, atomic bool, subjec
 		hdr = removeHeaderIfPresent(hdr, JSRequiredApiLevel)
 	}
 
+	// Fast publishing resets the cleanup timer.
+	// If cleanup has already happened, we can't continue.
+	cleanup := !atomic && !b.resetCleanupTimer(mset)
+
 	// Detect gaps.
 	b.lseq++
-	if b.lseq != batchSeq {
+	if b.lseq != batchSeq || cleanup {
 		reject := true
-		if !atomic {
-			// If a gap is detected, but it's okay, we only report about the gap and continue without rejecting.
-			if b.gapOk {
-				reject = false
-				buf, _ := json.Marshal(&BatchFlowAck{AckMessages: 10, LastSequence: b.lseq - 1, CurrentSequence: batchSeq})
-				outq.send(newJSPubMsg(reply, _EMPTY_, _EMPTY_, nil, buf, nil, 0))
-				b.lseq = batchSeq
-			}
+		// If a gap is detected, but it's okay, we only report about the gap and continue without rejecting.
+		if !atomic && !cleanup && b.gapOk {
+			reject = false
+			buf, _ := json.Marshal(&BatchFlowAck{AckMessages: b.ackMessages, LastSequence: b.lseq - 1, CurrentSequence: batchSeq})
+			outq.sendMsg(reply, buf)
+			b.lseq = batchSeq
 		}
 		if reject {
 			// Revert, since we incremented for the gap check.
@@ -6566,8 +6583,8 @@ func (mset *stream) processJetStreamBatchMsg(batchId string, atomic bool, subjec
 
 		// The first message in the batch responds with the settings used for flow control.
 		if batchSeq == 1 && canRespond {
-			buf, _ := json.Marshal(&BatchFlowAck{AckMessages: 10})
-			outq.send(newJSPubMsg(reply, _EMPTY_, _EMPTY_, nil, buf, nil, 0))
+			buf, _ := json.Marshal(&BatchFlowAck{AckMessages: b.ackMessages})
+			outq.sendMsg(reply, buf)
 		}
 
 		// Proceed with proposing this message.
@@ -6605,7 +6622,7 @@ func (mset *stream) processJetStreamBatchMsg(batchId string, atomic bool, subjec
 		}
 
 		// TODO(mvv): docs
-		if !commit {
+		if !commit && batchSeq%b.ackMessages != 0 {
 			reply = _EMPTY_
 		}
 
