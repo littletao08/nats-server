@@ -4867,7 +4867,7 @@ func (fs *fileStore) setWriteErr(err error) {
 		return
 	}
 	fs.werr = err
-	assert.Unreachable("Filestore encountered error during write", map[string]any{
+	assert.Unreachable("Filestore encountered write error", map[string]any{
 		"name":  fs.cfg.Name,
 		"err":   err,
 		"stack": string(debug.Stack()),
@@ -6882,6 +6882,7 @@ func (mb *msgBlock) writeMsgRecordLocked(rl, seq uint64, subj string, mhdr, msg 
 				"name":     mb.fs.cfg.Name,
 				"mb.index": mb.index,
 				"err":      rerr,
+				"stack":    string(debug.Stack()),
 			})
 		}
 	}()
@@ -7399,20 +7400,10 @@ func (fs *fileStore) syncBlocks() {
 	fs.firstMoved = false
 	fs.mu.Unlock()
 
-	storeFsWerrLocked := func(err error) {
-		if fs.werr == nil {
-			fs.werr = err
-			assert.Unreachable("Filestore encountered error during sync", map[string]any{
-				"name": fs.cfg.Name,
-				"err":  err,
-				"stack": string(debug.Stack()),
-			})
-		}
-	}
 	storeFsWerr := func(err error) {
 		fs.mu.Lock()
 		defer fs.mu.Unlock()
-		storeFsWerrLocked(err)
+		fs.setWriteErr(err)
 	}
 
 	var fsDmapLoaded bool
@@ -7429,7 +7420,6 @@ func (fs *fileStore) syncBlocks() {
 		// See if we can close FDs due to being idle.
 		if mb.mfd != nil && mb.sinceLastWriteActivity() > closeFDsIdle && mb.pendingWriteSizeLocked() == 0 {
 			if err := mb.dirtyCloseWithRemove(false); err != nil {
-				mb.werr = err
 				mb.mu.Unlock()
 				storeFsWerr(err)
 				continue
@@ -7450,7 +7440,6 @@ func (fs *fileStore) syncBlocks() {
 
 		// Flush anything that may be pending.
 		if _, err := mb.flushPendingMsgsLocked(); err != nil {
-			mb.werr = err
 			mb.mu.Unlock()
 			storeFsWerr(err)
 			continue
@@ -7482,9 +7471,6 @@ func (fs *fileStore) syncBlocks() {
 				continue
 			}
 			err := mb.compactWithFloor(firstSeq, &fsDmap)
-			if err != nil && mb.werr == nil {
-				mb.werr = err
-			}
 			// If this compact removed all raw bytes due to tombstone cleanup, schedule to remove.
 			shouldRemove := mb.rbytes == 0
 			mb.mu.Unlock()
@@ -7524,7 +7510,6 @@ func (fs *fileStore) syncBlocks() {
 				dios <- struct{}{}
 				didOpen = true
 				if err != nil && !os.IsNotExist(err) {
-					mb.werr = err
 					mb.mu.Unlock()
 					storeFsWerr(err)
 					continue
@@ -7533,7 +7518,6 @@ func (fs *fileStore) syncBlocks() {
 			// If we have an fd.
 			if fd != nil {
 				if err = fd.Sync(); err != nil {
-					mb.werr = err
 					mb.mu.Unlock()
 					storeFsWerr(err)
 					continue
@@ -7541,7 +7525,6 @@ func (fs *fileStore) syncBlocks() {
 				// If we opened the file close the fd.
 				if didOpen {
 					if err = fd.Close(); err != nil {
-						mb.werr = err
 						mb.mu.Unlock()
 						storeFsWerr(err)
 						continue
@@ -7571,16 +7554,16 @@ func (fs *fileStore) syncBlocks() {
 		fd, err = os.OpenFile(fn, os.O_RDWR, defaultFilePerms)
 		dios <- struct{}{}
 		if err != nil && !os.IsNotExist(err) {
-			storeFsWerrLocked(err)
+			fs.setWriteErr(err)
 			return
 		}
 		if fd != nil {
 			if err = fd.Sync(); err != nil {
-				storeFsWerrLocked(err)
+				fs.setWriteErr(err)
 				return
 			}
 			if err = fd.Close(); err != nil {
-				storeFsWerrLocked(err)
+				fs.setWriteErr(err)
 				return
 			}
 		}
@@ -7939,6 +7922,7 @@ func (mb *msgBlock) flushPendingMsgsLocked() (*LostStreamData, error) {
 				"name":     mb.fs.cfg.Name,
 				"mb.index": mb.index,
 				"err":      err,
+				"stack":    string(debug.Stack()),
 			})
 			return ld, err
 		}
@@ -7963,6 +7947,7 @@ func (mb *msgBlock) flushPendingMsgsLocked() (*LostStreamData, error) {
 				"name":     mb.fs.cfg.Name,
 				"mb.index": mb.index,
 				"err":      err,
+				"stack":    string(debug.Stack()),
 			})
 			return nil, err
 		}
