@@ -46,13 +46,18 @@ import (
 )
 
 // parseCron parses the given cron pattern and returns the next time it will fire based on the provided ts.
-func parseCron(pattern string, ts int64) (time.Time, error) {
+func parseCron(pattern string, tz string, ts int64) (time.Time, error) {
 	fields := strings.Fields(pattern)
 	if len(fields) != 6 {
 		return time.Time{}, fmt.Errorf("pattern requires 6 fields, got %d", len(fields))
 	}
 
-	var err error
+	// Load the time zone.
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		return time.Time{}, err
+	}
+
 	field := func(field string, r bounds) uint64 {
 		if err != nil {
 			return 0
@@ -81,7 +86,7 @@ func parseCron(pattern string, ts int64) (time.Time, error) {
 	// If the field doesn't match the schedule, then increment the field until it matches.
 	// While incrementing the field, a wrap-around brings it back to the beginning
 	// of the field list (since it is necessary to re-verify previous field values)
-	next := time.Unix(0, ts).UTC().Round(time.Second)
+	next := time.Unix(0, ts).In(loc).Round(time.Second)
 
 	// Start at the earliest possible time (the upcoming second).
 	next = next.Add(time.Second - time.Duration(next.Nanosecond())*time.Nanosecond)
@@ -99,7 +104,7 @@ WRAP:
 	for 1<<uint(next.Month())&month == 0 {
 		if !truncated {
 			truncated = true
-			next = time.Date(next.Year(), next.Month(), 1, 0, 0, 0, 0, time.UTC)
+			next = time.Date(next.Year(), next.Month(), 1, 0, 0, 0, 0, loc)
 		}
 		if next = next.AddDate(0, 1, 0); next.Month() == time.January {
 			goto WRAP
@@ -108,7 +113,7 @@ WRAP:
 	for !dayMatches(dayOfMonth, dayOfWeek, next) {
 		if !truncated {
 			truncated = true
-			next = time.Date(next.Year(), next.Month(), next.Day(), 0, 0, 0, 0, time.UTC)
+			next = time.Date(next.Year(), next.Month(), next.Day(), 0, 0, 0, 0, loc)
 		}
 		if next = next.AddDate(0, 0, 1); next.Day() == 1 {
 			goto WRAP
@@ -117,7 +122,7 @@ WRAP:
 	for 1<<uint(next.Hour())&hour == 0 {
 		if !truncated {
 			truncated = true
-			next = time.Date(next.Year(), next.Month(), next.Day(), next.Hour(), 0, 0, 0, time.UTC)
+			next = time.Date(next.Year(), next.Month(), next.Day(), next.Hour(), 0, 0, 0, loc)
 		}
 		if next = next.Add(time.Hour); next.Hour() == 0 {
 			goto WRAP
