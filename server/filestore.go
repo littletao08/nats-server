@@ -4866,6 +4866,11 @@ func (fs *fileStore) setWriteErr(err error) {
 	if fs.werr != nil {
 		return
 	}
+	// Ignore non-write errors.
+	if err == ErrStoreClosed {
+		return
+	}
+
 	fs.werr = err
 	assert.Unreachable("Filestore encountered write error", map[string]any{
 		"name":  fs.cfg.Name,
