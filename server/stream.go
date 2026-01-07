@@ -4984,9 +4984,17 @@ type FastBatch struct {
 	commitEob bool
 }
 
+const FastBatchSuffix = ".$FI"
+
+const (
+	FastBatchOpStart = iota
+	FastBatchOpAppend
+	FastBatchOpCommit
+	FastBatchOpCommitEob
+)
+
 func getFastBatch(reply string) (b FastBatch, ok bool) {
-	if len(reply) == 0 || !strings.HasSuffix(reply, ".$FI") {
-		ok = true
+	if len(reply) == 0 || !strings.HasSuffix(reply, FastBatchSuffix) {
 		return
 	}
 	n := len(reply) - 4 // Move to just before the dot
@@ -4994,54 +5002,60 @@ func getFastBatch(reply string) (b FastBatch, ok bool) {
 	if o == -1 {
 		return
 	}
-	op := reply[o+1 : n]
-	// FIXME(mvv): formalize op codes
-	if op == "0" || op == "1" || op == "2" || op == "3" {
-		b.commitEob = op == "3"
-		b.commit = b.commitEob || op == "2"
-		p := o
-		// Batch seq.
-		if o = strings.LastIndexByte(reply[:o], '.'); o == -1 {
-			return
-		} else {
-			b.seq, _ = strconv.ParseUint(reply[o+1:p], 10, 64)
-			p = o
-			if b.seq <= 0 {
-				return
-			}
-		}
-		// Gap mode.
-		if o = strings.LastIndexByte(reply[:o], '.'); o == -1 {
-			return
-		} else {
-			gapMode := reply[o+1 : p]
-			if gapMode != "ok" && gapMode != "fail" {
-				return // Not recognized.
-			}
-			b.gapOk = gapMode == "ok"
-			p = o
-		}
-		// Ack flow.
-		if o = strings.LastIndexByte(reply[:o], '.'); o == -1 {
-			return
-		} else {
-			b.flow, _ = strconv.ParseUint(reply[o+1:p], 10, 64)
-			if b.flow <= 0 {
-				b.flow = 10
-			}
-			p = o
-		}
-		// Batch id.
-		if o = strings.LastIndexByte(reply[:o], '.'); o == -1 {
-			return
-		} else {
-			b.id = reply[o+1 : p]
-		}
-		ok = true
-		return
-	} else {
+	// Batch operation.
+	ops := reply[o+1 : n]
+	op := parseInt64(stringToBytes(ops))
+	if op < FastBatchOpStart || op > FastBatchOpCommitEob {
 		return
 	}
+
+	b.commitEob = op == FastBatchOpCommitEob
+	b.commit = b.commitEob || op == FastBatchOpCommit
+	p := o
+	// Batch seq.
+	if o = strings.LastIndexByte(reply[:o], '.'); o == -1 {
+		return
+	} else {
+		b.seq, _ = strconv.ParseUint(reply[o+1:p], 10, 64)
+		p = o
+		if b.seq <= 0 {
+			return
+		}
+		if op == FastBatchOpStart && b.seq != 1 {
+			return
+		} else if op == FastBatchOpAppend && b.seq <= 1 {
+			return
+		}
+	}
+	// Gap mode.
+	if o = strings.LastIndexByte(reply[:o], '.'); o == -1 {
+		return
+	} else {
+		gapMode := reply[o+1 : p]
+		if gapMode != "ok" && gapMode != "fail" {
+			return // Not recognized.
+		}
+		b.gapOk = gapMode == "ok"
+		p = o
+	}
+	// Ack flow.
+	if o = strings.LastIndexByte(reply[:o], '.'); o == -1 {
+		return
+	} else {
+		b.flow, _ = strconv.ParseUint(reply[o+1:p], 10, 64)
+		if b.flow <= 0 {
+			b.flow = 10
+		}
+		p = o
+	}
+	// Batch id.
+	if o = strings.LastIndexByte(reply[:o], '.'); o == -1 {
+		return
+	} else {
+		b.id = reply[o+1 : p]
+	}
+	ok = true
+	return
 }
 
 // Fast lookup of batch sequence.
@@ -7256,7 +7270,7 @@ func (mset *stream) internalLoop() {
 			ims := msgs.pop()
 			for _, im := range ims {
 				// If we are clustered we need to propose this message to the underlying raft group.
-				if len(im.rply) > 0 && strings.HasSuffix(im.rply, ".$FI") {
+				if len(im.rply) > 0 && strings.HasSuffix(im.rply, FastBatchSuffix) {
 					mset.processJetStreamFastBatchMsg(im.subj, im.rply, im.hdr, im.msg, im.mt)
 				} else if batchId := getBatchId(im.hdr); batchId != _EMPTY_ {
 					mset.processJetStreamBatchMsg(batchId, im.subj, im.rply, im.hdr, im.msg, im.mt)
