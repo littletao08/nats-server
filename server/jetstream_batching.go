@@ -34,8 +34,9 @@ var (
 )
 
 type batching struct {
-	mu    sync.Mutex
-	group map[string]*batchGroup
+	mu     sync.Mutex
+	atomic map[string]*batchGroup
+	fast   map[string]*batchGroup
 }
 
 type batchGroup struct {
@@ -124,7 +125,7 @@ func (b *batchGroup) readyForCommit() bool {
 // Also returns whether a flow control message should be sent.
 // Lock should be held.
 func (batches *batching) fastBatchRegisterSequences(batchId string, batchSeq, streamSeq uint64) (*batchGroup, bool, string) {
-	if b, ok := batches.group[batchId]; ok {
+	if b, ok := batches.fast[batchId]; ok {
 		b.sseq = streamSeq
 		b.pseq = batchSeq
 		// If the PubAck needs to be sent now as a result of a commit.
@@ -176,10 +177,7 @@ func (batches *batching) fastBatchCommit(b *batchGroup, batchId string, mset *st
 // setupCleanupTimer sets up a timer to clean up the batch after a timeout.
 func (b *batchGroup) setupCleanupTimer(mset *stream, batchId string, batches *batching) {
 	// Create a timer to clean up after timeout.
-	timeout := streamMaxBatchTimeout
-	if maxBatchTimeout := mset.srv.getOpts().JetStreamLimits.MaxBatchTimeout; maxBatchTimeout > 0 {
-		timeout = maxBatchTimeout
-	}
+	timeout := getCleanupTimeout(mset)
 	b.timer = time.AfterFunc(timeout, func() {
 		b.cleanup(batchId, batches)
 		mset.sendStreamBatchAbandonedAdvisory(batchId, BatchTimeout)
@@ -189,11 +187,17 @@ func (b *batchGroup) setupCleanupTimer(mset *stream, batchId string, batches *ba
 // resetCleanupTimer resets the cleanup timer, allowing to extend the lifetime of the batch.
 // Returns whether the timer was reset without it having expired before.
 func (b *batchGroup) resetCleanupTimer(mset *stream) bool {
+	timeout := getCleanupTimeout(mset)
+	return b.timer.Reset(timeout)
+}
+
+// getCleanupTimeout returns the timeout for the batch, taking into account the server's limits.
+func getCleanupTimeout(mset *stream) time.Duration {
 	timeout := streamMaxBatchTimeout
 	if maxBatchTimeout := mset.srv.getOpts().JetStreamLimits.MaxBatchTimeout; maxBatchTimeout > 0 {
 		timeout = maxBatchTimeout
 	}
-	return b.timer.Reset(timeout)
+	return timeout
 }
 
 // cleanup deletes underlying resources associated with the batch and unregisters it from the stream's batches.
@@ -209,8 +213,10 @@ func (b *batchGroup) cleanupLocked(batchId string, batches *batching) {
 	b.timer.Stop()
 	if b.store != nil {
 		b.store.Delete(true)
+		delete(batches.atomic, batchId)
+	} else {
+		delete(batches.fast, batchId)
 	}
-	delete(batches.group, batchId)
 }
 
 // Lock should be held.

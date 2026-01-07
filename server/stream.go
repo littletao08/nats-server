@@ -592,12 +592,6 @@ const (
 	JSScheduleNextPurge = "purge" // If it's a non-repeating/delayed message, the schedule is purged.
 )
 
-// Header values for fast batch publish.
-const (
-	JSFastBatchGapFail = "fail"
-	JSFastBatchGapOk   = "ok"
-)
-
 // Headers for republished messages and direct get responses.
 const (
 	JSStream       = "Nats-Stream"
@@ -4557,14 +4551,18 @@ func (mset *stream) unsubscribeToStream(stopping, shuttingDown bool) error {
 func (mset *stream) deleteInflightBatches(shuttingDown bool) {
 	if mset.batches != nil {
 		mset.batches.mu.Lock()
-		for batchId, b := range mset.batches.group {
-			// If shutting down, do fixup during startup. In-memory batches don't require manual cleanup.
-			if shuttingDown {
-				b.stopLocked()
-			} else {
-				b.cleanupLocked(batchId, mset.batches)
+		clearBatches := func(group map[string]*batchGroup) {
+			for batchId, b := range group {
+				// If shutting down, do fixup during startup. In-memory batches don't require manual cleanup.
+				if shuttingDown {
+					b.stopLocked()
+				} else {
+					b.cleanupLocked(batchId, mset.batches)
+				}
 			}
 		}
+		clearBatches(mset.batches.atomic)
+		clearBatches(mset.batches.fast)
 		mset.batches.mu.Unlock()
 		mset.batches = nil
 	}
@@ -4984,7 +4982,11 @@ type FastBatch struct {
 	commitEob bool
 }
 
-const FastBatchSuffix = ".$FI"
+const (
+	FastBatchSuffix  = ".$FI"
+	FastBatchGapFail = "fail"
+	FastBatchGapOk   = "ok"
+)
 
 const (
 	FastBatchOpStart = iota
@@ -4993,6 +4995,8 @@ const (
 	FastBatchOpCommitEob
 )
 
+// getFastBatch gets fast batch info from the reply subject in the form:
+// <prefix>.<uuid>.<initial flow>.<gap mode>.<batch seq>.<operation>.$FI
 func getFastBatch(reply string) (b FastBatch, ok bool) {
 	if len(reply) == 0 || !strings.HasSuffix(reply, FastBatchSuffix) {
 		return
@@ -5032,10 +5036,10 @@ func getFastBatch(reply string) (b FastBatch, ok bool) {
 		return
 	} else {
 		gapMode := reply[o+1 : p]
-		if gapMode != "ok" && gapMode != "fail" {
+		if gapMode != FastBatchGapFail && gapMode != FastBatchGapOk {
 			return // Not recognized.
 		}
-		b.gapOk = gapMode == "ok"
+		b.gapOk = gapMode == FastBatchGapOk
 		p = o
 	}
 	// Ack flow.
@@ -6405,9 +6409,9 @@ func (mset *stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, 
 	return nil
 }
 
-// processJetStreamBatchMsg processes a JetStream message that's part of an atomic or fast batch publish.
+// processJetStreamAtomicBatchMsg processes a JetStream message that's part of an atomic batch publish.
 // Handles constraints around the batch, storing messages, doing consistency checks, and performing the commit.
-func (mset *stream) processJetStreamBatchMsg(batchId, subject, reply string, hdr, msg []byte, mt *msgTrace) (retErr error) {
+func (mset *stream) processJetStreamAtomicBatchMsg(batchId, subject, reply string, hdr, msg []byte, mt *msgTrace) (retErr error) {
 	mset.mu.RLock()
 	canRespond := !mset.cfg.NoAck && len(reply) > 0
 	name, stype := mset.cfg.Name, mset.cfg.Storage
@@ -6491,9 +6495,7 @@ func (mset *stream) processJetStreamBatchMsg(batchId, subject, reply string, hdr
 
 	mset.mu.Lock()
 	if mset.batches == nil {
-		mset.batches = &batching{
-			group: make(map[string]*batchGroup, 1),
-		}
+		mset.batches = &batching{}
 	}
 	batches := mset.batches
 	mset.mu.Unlock()
@@ -6504,7 +6506,7 @@ func (mset *stream) processJetStreamBatchMsg(batchId, subject, reply string, hdr
 
 	// Get batch.
 	batches.mu.Lock()
-	b, ok := batches.group[batchId]
+	b, ok := batches.atomic[batchId]
 	if !ok {
 		if batchSeq != 1 {
 			batches.mu.Unlock()
@@ -6532,7 +6534,7 @@ func (mset *stream) processJetStreamBatchMsg(batchId, subject, reply string, hdr
 		}
 
 		// Confirm we can facilitate an additional batch.
-		if len(batches.group)+1 > maxInflightPerStream {
+		if len(batches.atomic)+1 > maxInflightPerStream {
 			batches.mu.Unlock()
 			return respondIncompleteBatch()
 		}
@@ -6551,7 +6553,10 @@ func (mset *stream) processJetStreamBatchMsg(batchId, subject, reply string, hdr
 			batches.mu.Unlock()
 			return respondIncompleteBatch()
 		}
-		batches.group[batchId] = b
+		if batches.atomic == nil {
+			batches.atomic = make(map[string]*batchGroup, 1)
+		}
+		batches.atomic[batchId] = b
 	}
 
 	var commit, commitEob bool
@@ -6779,6 +6784,8 @@ func (mset *stream) processJetStreamBatchMsg(batchId, subject, reply string, hdr
 	return nil
 }
 
+// processJetStreamFastBatchMsg processes a JetStream message that's part of an atomic batch publish.
+// Handles constraints around the batch, storing messages, doing consistency checks, and performing the commit.
 func (mset *stream) processJetStreamFastBatchMsg(subject, reply string, hdr, msg []byte, mt *msgTrace) (retErr error) {
 	mset.mu.RLock()
 	canRespond := !mset.cfg.NoAck && len(reply) > 0
@@ -6863,16 +6870,14 @@ func (mset *stream) processJetStreamFastBatchMsg(subject, reply string, hdr, msg
 
 	mset.mu.Lock()
 	if mset.batches == nil {
-		mset.batches = &batching{
-			group: make(map[string]*batchGroup, 1),
-		}
+		mset.batches = &batching{}
 	}
 	batches := mset.batches
 	mset.mu.Unlock()
 
 	// Get batch.
 	batches.mu.Lock()
-	b, ok := batches.group[batch.id]
+	b, ok := batches.fast[batch.id]
 	if !ok {
 		if batch.seq != 1 {
 			batches.mu.Unlock()
@@ -6881,7 +6886,10 @@ func (mset *stream) processJetStreamFastBatchMsg(subject, reply string, hdr, msg
 		// We'll need a copy as we'll use it as a key and later for cleanup.
 		batchId := copyString(batch.id)
 		b = batches.newFastBatchGroup(mset, batchId, batch.gapOk, batch.flow)
-		batches.group[batchId] = b
+		if batches.fast == nil {
+			batches.fast = make(map[string]*batchGroup, 1)
+		}
+		batches.fast[batchId] = b
 	}
 
 	// The required API level can have the batch be rejected. But the header is always removed.
@@ -7273,7 +7281,7 @@ func (mset *stream) internalLoop() {
 				if len(im.rply) > 0 && strings.HasSuffix(im.rply, FastBatchSuffix) {
 					mset.processJetStreamFastBatchMsg(im.subj, im.rply, im.hdr, im.msg, im.mt)
 				} else if batchId := getBatchId(im.hdr); batchId != _EMPTY_ {
-					mset.processJetStreamBatchMsg(batchId, im.subj, im.rply, im.hdr, im.msg, im.mt)
+					mset.processJetStreamAtomicBatchMsg(batchId, im.subj, im.rply, im.hdr, im.msg, im.mt)
 				} else if isClustered {
 					mset.processClusteredInboundMsg(im.subj, im.rply, im.hdr, im.msg, im.mt, false)
 				} else {

@@ -132,6 +132,7 @@ func TestJetStreamAtomicBatchPublish(t *testing.T) {
 
 			pubAck = JSPubAckResponse{}
 			require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+			require_True(t, pubAck.Error == nil)
 			require_Equal(t, pubAck.Sequence, 6)
 			require_Equal(t, pubAck.BatchId, "uuid")
 			require_Equal(t, pubAck.BatchSize, 5)
@@ -393,7 +394,7 @@ func TestJetStreamAtomicBatchPublishLimits(t *testing.T) {
 				return errors.New("batches not found")
 			}
 			batches.mu.Lock()
-			groups := len(batches.group)
+			groups := len(batches.atomic)
 			batches.mu.Unlock()
 			if groups != 0 {
 				return fmt.Errorf("expected 0 groups, got %d", groups)
@@ -684,8 +685,8 @@ func TestJetStreamAtomicBatchPublishCleanup(t *testing.T) {
 		require_NotNil(t, batches)
 		require_NotNil(t, batch)
 		batches.mu.Lock()
-		groups := len(batches.group)
-		b := batches.group["uuid"]
+		groups := len(batches.atomic)
+		b := batches.atomic["uuid"]
 		batches.mu.Unlock()
 		require_Len(t, groups, 1)
 		require_NotNil(t, b)
@@ -720,7 +721,7 @@ func TestJetStreamAtomicBatchPublishCleanup(t *testing.T) {
 					return fmt.Errorf("expected no batches")
 				}
 				batches.mu.Lock()
-				groups = len(batches.group)
+				groups = len(batches.atomic)
 				batches.mu.Unlock()
 				if groups > 0 {
 					return fmt.Errorf("expected 0 groups, got %d", groups)
@@ -2893,7 +2894,7 @@ func TestJetStreamAtomicBatchPublishCommitUnsupported(t *testing.T) {
 		batches := mset.batches
 		mset.mu.RUnlock()
 		batches.mu.Lock()
-		groups := len(batches.group)
+		groups := len(batches.atomic)
 		batches.mu.Unlock()
 		require_Len(t, groups, 0)
 	}
@@ -2924,13 +2925,6 @@ func TestJetStreamAtomicBatchPublishCommitUnsupported(t *testing.T) {
 	require_NoError(t, err)
 	require_Len(t, len(sliceHeader(JSRequiredApiLevel, sm.Header)), 0)
 }
-
-const (
-	FastBatchStartOp = iota
-	FastBatchAppendOp
-	FastBatchCommitOp
-	FastBatchCommitEobOp
-)
 
 func generateFastBatchReply(inbox string, batchId string, batchSeq uint64, flow uint64, gap string, op int) string {
 	return fmt.Sprintf("%s.%s.%d.%s.%d.%d.$FI", inbox, batchId, flow, gap, batchSeq, op)
@@ -2969,7 +2963,7 @@ func TestJetStreamFastBatchPublish(t *testing.T) {
 		defer sub.Drain()
 
 		m := nats.NewMsg("foo.0")
-		m.Reply = generateFastBatchReply(inbox, "uuid", 0, 0, JSFastBatchGapFail, FastBatchStartOp)
+		m.Reply = generateFastBatchReply(inbox, "uuid", 0, 0, FastBatchGapFail, FastBatchOpStart)
 		m.Data = []byte("foo.0")
 
 		// Publish with batch publish disabled.
@@ -2986,7 +2980,7 @@ func TestJetStreamFastBatchPublish(t *testing.T) {
 		require_NoError(t, err)
 
 		// Publish with incorrect batch sequence errors.
-		m.Reply = generateFastBatchReply(inbox, "uuid", 0, 0, JSFastBatchGapFail, FastBatchStartOp)
+		m.Reply = generateFastBatchReply(inbox, "uuid", 0, 0, FastBatchGapFail, FastBatchOpStart)
 		require_NoError(t, nc.PublishMsg(m))
 		rmsg, err = sub.NextMsg(time.Second)
 		require_NoError(t, err)
@@ -2996,7 +2990,7 @@ func TestJetStreamFastBatchPublish(t *testing.T) {
 
 		// A batch ID must not exceed the maximum length.
 		longBatchId := strings.Repeat("A", 65)
-		m.Reply = generateFastBatchReply(inbox, longBatchId, 1, 0, JSFastBatchGapFail, FastBatchStartOp)
+		m.Reply = generateFastBatchReply(inbox, longBatchId, 1, 0, FastBatchGapFail, FastBatchOpStart)
 		require_NoError(t, nc.PublishMsg(m))
 		rmsg, err = sub.NextMsg(time.Second)
 		require_NoError(t, err)
@@ -3006,7 +3000,7 @@ func TestJetStreamFastBatchPublish(t *testing.T) {
 		require_Error(t, pubAck.Error, NewJSBatchPublishInvalidBatchIDError())
 
 		// Publish a batch, misses start.
-		m.Reply = generateFastBatchReply(inbox, "uuid", 2, 0, JSFastBatchGapFail, FastBatchAppendOp)
+		m.Reply = generateFastBatchReply(inbox, "uuid", 2, 0, FastBatchGapFail, FastBatchOpAppend)
 		require_NoError(t, nc.PublishMsg(m))
 		rmsg, err = sub.NextMsg(time.Second)
 		require_NoError(t, err)
@@ -3015,7 +3009,7 @@ func TestJetStreamFastBatchPublish(t *testing.T) {
 		require_Error(t, pubAck.Error, NewJSBatchPublishUnknownBatchIDError())
 
 		// Publish a "batch" which immediately commits.
-		m.Reply = generateFastBatchReply(inbox, "uuid", 1, 0, JSFastBatchGapFail, FastBatchCommitOp)
+		m.Reply = generateFastBatchReply(inbox, "uuid", 1, 0, FastBatchGapFail, FastBatchOpCommit)
 		require_NoError(t, nc.PublishMsg(m))
 		rmsg, err = sub.NextMsg(time.Second)
 		require_NoError(t, err)
@@ -3035,11 +3029,11 @@ func TestJetStreamFastBatchPublish(t *testing.T) {
 			m.Subject = fmt.Sprintf("foo.%d", seq)
 			m.Data = []byte(m.Subject)
 			if seq == batch {
-				m.Reply = generateFastBatchReply(inbox, "uuid", seq, 0, JSFastBatchGapFail, FastBatchCommitOp)
+				m.Reply = generateFastBatchReply(inbox, "uuid", seq, 0, FastBatchGapFail, FastBatchOpCommit)
 			} else if seq == 1 {
-				m.Reply = generateFastBatchReply(inbox, "uuid", seq, 0, JSFastBatchGapFail, FastBatchStartOp)
+				m.Reply = generateFastBatchReply(inbox, "uuid", seq, 0, FastBatchGapFail, FastBatchOpStart)
 			} else {
-				m.Reply = generateFastBatchReply(inbox, "uuid", seq, 0, JSFastBatchGapFail, FastBatchAppendOp)
+				m.Reply = generateFastBatchReply(inbox, "uuid", seq, 0, FastBatchGapFail, FastBatchOpAppend)
 			}
 			require_NoError(t, nc.PublishMsg(m))
 
@@ -3117,7 +3111,7 @@ func TestJetStreamFastBatchPublishGapDetection(t *testing.T) {
 		defer sub.Drain()
 
 		m := nats.NewMsg("foo")
-		m.Reply = generateFastBatchReply(inbox, "uuid", 1, 0, gapMode, FastBatchStartOp)
+		m.Reply = generateFastBatchReply(inbox, "uuid", 1, 0, gapMode, FastBatchOpStart)
 		require_NoError(t, nc.PublishMsg(m))
 		rmsg, err := sub.NextMsg(time.Second)
 		require_NoError(t, err)
@@ -3135,7 +3129,7 @@ func TestJetStreamFastBatchPublishGapDetection(t *testing.T) {
 		require_Equal(t, batchFlowAck.AckMessages, 10)
 
 		// Now a message is missed and a gap should be detected.
-		m.Reply = generateFastBatchReply(inbox, "uuid", 3, 0, gapMode, FastBatchAppendOp)
+		m.Reply = generateFastBatchReply(inbox, "uuid", 3, 0, gapMode, FastBatchOpAppend)
 		require_NoError(t, nc.PublishMsg(m))
 		rmsg, err = sub.NextMsg(time.Second)
 		require_NoError(t, err)
@@ -3149,7 +3143,7 @@ func TestJetStreamFastBatchPublishGapDetection(t *testing.T) {
 		require_Equal(t, batchFlowAck.AckMessages, 0)
 
 		switch gapMode {
-		case JSFastBatchGapFail:
+		case FastBatchGapFail:
 			// By default, if a gap is detected, the batch is rejected.
 			// A PubAck is returned with the data that has been persisted up to that point.
 			rmsg, err = sub.NextMsg(time.Second)
@@ -3159,10 +3153,10 @@ func TestJetStreamFastBatchPublishGapDetection(t *testing.T) {
 			require_Equal(t, pubAck.Sequence, 1)
 			require_Equal(t, pubAck.BatchId, "uuid")
 			require_Equal(t, pubAck.BatchSize, 1)
-		case JSFastBatchGapOk:
+		case FastBatchGapOk:
 			// If a gap is ok, the batch will continue to function.
 			// An EOB commit should get us the PubAck for the third message.
-			m.Reply = generateFastBatchReply(inbox, "uuid", 4, 0, gapMode, FastBatchCommitEobOp)
+			m.Reply = generateFastBatchReply(inbox, "uuid", 4, 0, gapMode, FastBatchOpCommitEob)
 			require_NoError(t, nc.PublishMsg(m))
 			rmsg, err = sub.NextMsg(time.Second)
 			require_NoError(t, err)
@@ -3250,11 +3244,11 @@ func TestJetStreamFastBatchPublishFlowControl(t *testing.T) {
 		lseq := uint64(5)
 		for seq := uint64(1); seq <= lseq; seq++ {
 			if seq == lseq {
-				m.Reply = generateFastBatchReply(inbox, "uuid", seq, 2, JSFastBatchGapFail, FastBatchCommitOp)
+				m.Reply = generateFastBatchReply(inbox, "uuid", seq, 2, FastBatchGapFail, FastBatchOpCommit)
 			} else if seq == 1 {
-				m.Reply = generateFastBatchReply(inbox, "uuid", seq, 2, JSFastBatchGapFail, FastBatchStartOp)
+				m.Reply = generateFastBatchReply(inbox, "uuid", seq, 2, FastBatchGapFail, FastBatchOpStart)
 			} else {
-				m.Reply = generateFastBatchReply(inbox, "uuid", seq, 2, JSFastBatchGapFail, FastBatchAppendOp)
+				m.Reply = generateFastBatchReply(inbox, "uuid", seq, 2, FastBatchGapFail, FastBatchOpAppend)
 			}
 			require_NoError(t, nc.PublishMsg(m))
 
@@ -3312,9 +3306,9 @@ func TestJetStreamFastBatchPublishSourceAndMirror(t *testing.T) {
 		for seq := uint64(1); seq <= 3; seq++ {
 			m := nats.NewMsg("foo")
 			if seq == 1 {
-				m.Reply = generateFastBatchReply("", "uuid", seq, 10, JSFastBatchGapFail, FastBatchStartOp)
+				m.Reply = generateFastBatchReply("", "uuid", seq, 10, FastBatchGapFail, FastBatchOpStart)
 			} else {
-				m.Reply = generateFastBatchReply("", "uuid", seq, 10, JSFastBatchGapFail, FastBatchAppendOp)
+				m.Reply = generateFastBatchReply("", "uuid", seq, 10, FastBatchGapFail, FastBatchOpAppend)
 			}
 			commit := seq == 3
 			if !commit {
@@ -3327,7 +3321,7 @@ func TestJetStreamFastBatchPublishSourceAndMirror(t *testing.T) {
 			require_NoError(t, err)
 			defer sub.Drain()
 
-			m.Reply = generateFastBatchReply(inbox, "uuid", seq, 10, JSFastBatchGapFail, FastBatchCommitOp)
+			m.Reply = generateFastBatchReply(inbox, "uuid", seq, 10, FastBatchGapFail, FastBatchOpCommit)
 			require_NoError(t, nc.PublishMsg(m))
 			rmsg, err := sub.NextMsg(time.Second)
 			require_NoError(t, err)
