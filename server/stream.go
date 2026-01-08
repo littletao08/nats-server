@@ -5002,6 +5002,25 @@ var seq uint64
 //	gapOk: false,
 //}
 
+var fastBatchPool sync.Pool
+
+func getFastBatchFromPool() *FastBatch {
+	idx := fastBatchPool.Get()
+	if idx != nil {
+		return idx.(*FastBatch)
+	}
+	return new(FastBatch)
+}
+
+func (b *FastBatch) returnToPool() {
+	if b == nil {
+		return
+	}
+	// Nil out all values.
+	*b = FastBatch{}
+	fastBatchPool.Put(b)
+}
+
 // getFastBatch gets fast batch info from the reply subject in the form:
 // <prefix>.<uuid>.<initial flow>.<gap mode>.<batch seq>.<operation>.$FI
 func getFastBatch(reply string) (*FastBatch, bool) {
@@ -5019,18 +5038,18 @@ func getFastBatch(reply string) (*FastBatch, bool) {
 	//}
 	//return &b, true
 
-	var b FastBatch
+	b := getFastBatchFromPool()
 
 	n := len(reply) - 4 // Move to just before the dot
 	o := strings.LastIndexByte(reply[:n], '.')
 	if o == -1 {
-		return nil, false
+		return nil, true
 	}
 	// Batch operation.
 	ops := reply[o+1 : n]
 	op := parseInt64(stringToBytes(ops))
 	if op < FastBatchOpStart || op > FastBatchOpCommitEob {
-		return nil, false
+		return nil, true
 	}
 
 	b.commitEob = op == FastBatchOpCommitEob
@@ -5038,38 +5057,38 @@ func getFastBatch(reply string) (*FastBatch, bool) {
 	p := o
 	// Batch seq.
 	if o = strings.LastIndexByte(reply[:o], '.'); o == -1 {
-		return nil, false
+		return nil, true
 	} else {
 		a := parseInt64(stringToBytes(reply[o+1:p]))
 		if a < 1 {
-			return nil, false
+			return nil, true
 		}
 		b.seq = uint64(a)
 		//b.seq, _ = strconv.ParseUint(reply[o+1:p], 10, 64)
 		p = o
 		if b.seq <= 0 {
-			return nil, false
+			return nil, true
 		}
 		if op == FastBatchOpStart && b.seq != 1 {
-			return nil, false
+			return nil, true
 		} else if op == FastBatchOpAppend && b.seq <= 1 {
-			return nil, false
+			return nil, true
 		}
 	}
 	// Gap mode.
 	if o = strings.LastIndexByte(reply[:o], '.'); o == -1 {
-		return nil, false
+		return nil, true
 	} else {
 		gapMode := reply[o+1 : p]
 		if gapMode != FastBatchGapFail && gapMode != FastBatchGapOk {
-			return nil, false // Not recognized.
+			return nil, true // Not recognized.
 		}
 		b.gapOk = gapMode == FastBatchGapOk
 		p = o
 	}
 	// Ack flow.
 	if o = strings.LastIndexByte(reply[:o], '.'); o == -1 {
-		return nil, false
+		return nil, true
 	} else {
 		a := parseInt64(stringToBytes(reply[o+1:p]))
 		if a <= 0 {
@@ -5084,7 +5103,7 @@ func getFastBatch(reply string) (*FastBatch, bool) {
 	}
 	// Batch id.
 	if o = strings.LastIndexByte(reply[:o], '.'); o == -1 {
-		return nil, false
+		return nil, true
 	} else {
 		b.id = reply[o+1 : p]
 	}
@@ -5095,7 +5114,7 @@ func getFastBatch(reply string) (*FastBatch, bool) {
 	if b.seq == 5_000_000 {
 		b.commit = true
 	}
-	return &b, true
+	return b, false
 }
 
 // Fast lookup of batch sequence.
@@ -5651,7 +5670,8 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 		// Disable consistency checking if this was already done
 		// earlier as part of the batch consistency check.
 		canConsistencyCheck = traceOnly
-	} else if fastBatch, ok := getFastBatch(reply); ok && fastBatch.id != _EMPTY_ {
+	} else if fastBatch, _ = getFastBatch(reply); fastBatch != nil {
+		defer fastBatch.returnToPool()
 		batchId, batchSeq = fastBatch.id, fastBatch.seq
 		// Disable consistency checking if this was already done
 		// earlier as part of the batch consistency check.
@@ -6903,10 +6923,9 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 		return respondError(NewJSBatchPublishDisabledError())
 	}
 
-	//batch, ok := getFastBatch(reply)
-	//if !ok || batch.id == _EMPTY_ {
-	//	return respondError(NewJSBatchPublishInvalidPatternError())
-	//}
+	if batch == nil {
+		return respondError(NewJSBatchPublishInvalidPatternError())
+	}
 
 	// Batch ID is too long.
 	if len(batch.id) > 64 {
@@ -7323,8 +7342,9 @@ func (mset *stream) internalLoop() {
 			ims := msgs.pop()
 			for _, im := range ims {
 				// If we are clustered we need to propose this message to the underlying raft group.
-				if batch, ok := getFastBatch(im.rply); ok {
+				if batch, err := getFastBatch(im.rply); batch != nil || err {
 					mset.processJetStreamFastBatchMsg(batch, im.subj, im.rply, im.hdr, im.msg, im.mt)
+					batch.returnToPool()
 				} else if batchId := getBatchId(im.hdr); batchId != _EMPTY_ {
 					mset.processJetStreamAtomicBatchMsg(batchId, im.subj, im.rply, im.hdr, im.msg, im.mt)
 				} else if isClustered {
