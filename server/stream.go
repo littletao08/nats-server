@@ -4995,22 +4995,37 @@ const (
 	FastBatchOpCommitEob
 )
 
+var seq uint64
+var b = FastBatch{
+	id: "id",
+	flow: 500,
+	gapOk: false,
+}
+
 // getFastBatch gets fast batch info from the reply subject in the form:
 // <prefix>.<uuid>.<initial flow>.<gap mode>.<batch seq>.<operation>.$FI
-func getFastBatch(reply string) (b FastBatch, ok bool) {
+func getFastBatch(reply string) (FastBatch, bool) {
 	if len(reply) == 0 || !strings.HasSuffix(reply, FastBatchSuffix) {
-		return
+		return FastBatch{}, false
 	}
+
+	//b.seq = seq / 2 + 1
+	//seq++
+	//if b.seq == 2_000_000 {
+	//	b.commit = true
+	//}
+	//return b, true
+
 	n := len(reply) - 4 // Move to just before the dot
 	o := strings.LastIndexByte(reply[:n], '.')
 	if o == -1 {
-		return
+		return FastBatch{}, false
 	}
 	// Batch operation.
 	ops := reply[o+1 : n]
 	op := parseInt64(stringToBytes(ops))
 	if op < FastBatchOpStart || op > FastBatchOpCommitEob {
-		return
+		return FastBatch{}, false
 	}
 
 	b.commitEob = op == FastBatchOpCommitEob
@@ -5018,48 +5033,63 @@ func getFastBatch(reply string) (b FastBatch, ok bool) {
 	p := o
 	// Batch seq.
 	if o = strings.LastIndexByte(reply[:o], '.'); o == -1 {
-		return
+		return FastBatch{}, false
 	} else {
-		b.seq, _ = strconv.ParseUint(reply[o+1:p], 10, 64)
+		a := parseInt64(stringToBytes(reply[o+1:p]))
+		if a < 1 {
+			return FastBatch{}, false
+		}
+		b.seq = uint64(a)
+		//b.seq, _ = strconv.ParseUint(reply[o+1:p], 10, 64)
 		p = o
 		if b.seq <= 0 {
-			return
+			return FastBatch{}, false
 		}
 		if op == FastBatchOpStart && b.seq != 1 {
-			return
+			return FastBatch{}, false
 		} else if op == FastBatchOpAppend && b.seq <= 1 {
-			return
+			return FastBatch{}, false
 		}
 	}
 	// Gap mode.
 	if o = strings.LastIndexByte(reply[:o], '.'); o == -1 {
-		return
+		return FastBatch{}, false
 	} else {
 		gapMode := reply[o+1 : p]
 		if gapMode != FastBatchGapFail && gapMode != FastBatchGapOk {
-			return // Not recognized.
+			return FastBatch{}, false // Not recognized.
 		}
 		b.gapOk = gapMode == FastBatchGapOk
 		p = o
 	}
 	// Ack flow.
 	if o = strings.LastIndexByte(reply[:o], '.'); o == -1 {
-		return
+		return FastBatch{}, false
 	} else {
-		b.flow, _ = strconv.ParseUint(reply[o+1:p], 10, 64)
-		if b.flow <= 0 {
-			b.flow = 10
+		a := parseInt64(stringToBytes(reply[o+1:p]))
+		if a <= 0 {
+			a = 10
 		}
+		b.flow = uint64(a)
+		//b.flow, _ = strconv.ParseUint(reply[o+1:p], 10, 64)
+		//if b.flow <= 0 {
+		//	b.flow = 10
+		//}
 		p = o
 	}
 	// Batch id.
 	if o = strings.LastIndexByte(reply[:o], '.'); o == -1 {
-		return
+		return FastBatch{}, false
 	} else {
 		b.id = reply[o+1 : p]
 	}
-	ok = true
-	return
+
+	b.seq = seq / 2 + 1
+	seq++
+	if b.seq == 2_000_000 {
+		b.commit = true
+	}
+	return b, true
 }
 
 // Fast lookup of batch sequence.
