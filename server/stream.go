@@ -5019,7 +5019,7 @@ func getFastBatch(reply string) (*FastBatch, bool) {
 	//}
 	//return &b, true
 
-	var b = FastBatch{}
+	var b FastBatch
 
 	n := len(reply) - 4 // Move to just before the dot
 	o := strings.LastIndexByte(reply[:n], '.')
@@ -5089,7 +5089,8 @@ func getFastBatch(reply string) (*FastBatch, bool) {
 		b.id = reply[o+1 : p]
 	}
 
-	b.seq = seq / 2 + 1
+	//b.seq = seq / 2 + 1
+	b.seq = seq + 1
 	seq++
 	if b.seq == 5_000_000 {
 		b.commit = true
@@ -5573,7 +5574,11 @@ var (
 )
 
 // processJetStreamMsg is where we try to actually process the stream msg.
-func (mset *stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, lseq uint64, ts int64, mt *msgTrace, sourced bool, needLock bool) (retErr error) {
+func (mset *stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, lseq uint64, ts int64, mt *msgTrace, sourced bool, needLock bool) error {
+	return mset.processJetStreamMsgWithBatch(subject, reply, hdr, msg, lseq, ts, mt, sourced, needLock, nil)
+}
+
+func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg []byte, lseq uint64, ts int64, mt *msgTrace, sourced bool, needLock bool, fastBatch *FastBatch) (retErr error) {
 	if mt != nil {
 		// Only the leader/standalone will have mt!=nil. On exit, send the
 		// message trace event.
@@ -5641,8 +5646,13 @@ func (mset *stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, 
 		batchAtomic bool
 	)
 	// Populate batch details.
-	if b, ok := getFastBatch(reply); ok && b.id != _EMPTY_ {
-		batchId, batchSeq = b.id, b.seq
+	if fastBatch != nil {
+		batchId, batchSeq = fastBatch.id, fastBatch.seq
+		// Disable consistency checking if this was already done
+		// earlier as part of the batch consistency check.
+		canConsistencyCheck = traceOnly
+	} else if fastBatch, ok := getFastBatch(reply); ok && fastBatch.id != _EMPTY_ {
+		batchId, batchSeq = fastBatch.id, fastBatch.seq
 		// Disable consistency checking if this was already done
 		// earlier as part of the batch consistency check.
 		canConsistencyCheck = traceOnly
@@ -7003,7 +7013,7 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 	}
 	if !isClustered {
 		mset.clMu.Unlock()
-		return mset.processJetStreamMsg(subject, reply, hdr, msg, 0, 0, mt, false, true)
+		return mset.processJetStreamMsgWithBatch(subject, reply, hdr, msg, 0, 0, mt, false, true, batch)
 	}
 	commitSingleMsg(diff, mset, subject, reply, hdr, msg, name, jsa, mt, node, r, lseq)
 	mset.clMu.Unlock()
