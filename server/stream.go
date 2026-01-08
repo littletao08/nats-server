@@ -5091,7 +5091,7 @@ func getFastBatch(reply string) (*FastBatch, bool) {
 
 	b.seq = seq / 2 + 1
 	seq++
-	if b.seq == 2_000_000 {
+	if b.seq == 5_000_000 {
 		b.commit = true
 	}
 	return &b, true
@@ -6821,7 +6821,7 @@ func (mset *stream) processJetStreamAtomicBatchMsg(batchId, subject, reply strin
 
 // processJetStreamFastBatchMsg processes a JetStream message that's part of an atomic batch publish.
 // Handles constraints around the batch, storing messages, doing consistency checks, and performing the commit.
-func (mset *stream) processJetStreamFastBatchMsg(subject, reply string, hdr, msg []byte, mt *msgTrace) (retErr error) {
+func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, reply string, hdr, msg []byte, mt *msgTrace) (retErr error) {
 	mset.mu.RLock()
 	canRespond := !mset.cfg.NoAck && len(reply) > 0
 	name, stype := mset.cfg.Name, mset.cfg.Storage
@@ -6893,10 +6893,10 @@ func (mset *stream) processJetStreamFastBatchMsg(subject, reply string, hdr, msg
 		return respondError(NewJSBatchPublishDisabledError())
 	}
 
-	batch, ok := getFastBatch(reply)
-	if !ok || batch.id == _EMPTY_ {
-		return respondError(NewJSBatchPublishInvalidPatternError())
-	}
+	//batch, ok := getFastBatch(reply)
+	//if !ok || batch.id == _EMPTY_ {
+	//	return respondError(NewJSBatchPublishInvalidPatternError())
+	//}
 
 	// Batch ID is too long.
 	if len(batch.id) > 64 {
@@ -7313,8 +7313,8 @@ func (mset *stream) internalLoop() {
 			ims := msgs.pop()
 			for _, im := range ims {
 				// If we are clustered we need to propose this message to the underlying raft group.
-				if len(im.rply) > 0 && strings.HasSuffix(im.rply, FastBatchSuffix) {
-					mset.processJetStreamFastBatchMsg(im.subj, im.rply, im.hdr, im.msg, im.mt)
+				if batch, ok := getFastBatch(im.rply); ok {
+					mset.processJetStreamFastBatchMsg(batch, im.subj, im.rply, im.hdr, im.msg, im.mt)
 				} else if batchId := getBatchId(im.hdr); batchId != _EMPTY_ {
 					mset.processJetStreamAtomicBatchMsg(batchId, im.subj, im.rply, im.hdr, im.msg, im.mt)
 				} else if isClustered {
