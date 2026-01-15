@@ -3011,11 +3011,7 @@ func TestJetStreamFastBatchPublish(t *testing.T) {
 		// Publish a "batch" which immediately commits.
 		m.Reply = generateFastBatchReply(inbox, "uuid", 1, 0, FastBatchGapFail, FastBatchOpCommit)
 		require_NoError(t, nc.PublishMsg(m))
-		rmsg, err = sub.NextMsg(time.Second)
-		require_NoError(t, err)
-		batchFlowAck = BatchFlowAck{}
-		require_NoError(t, json.Unmarshal(rmsg.Data, &batchFlowAck))
-		require_Equal(t, batchFlowAck.AckMessages, 10)
+		// The PubAck comes in immediately without an intermediate BatchFlowAck.
 		rmsg, err = sub.NextMsg(time.Second)
 		require_NoError(t, err)
 		pubAck = JSPubAckResponse{}

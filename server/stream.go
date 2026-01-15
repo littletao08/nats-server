@@ -278,14 +278,12 @@ type CounterSources map[string]map[string]string
 
 // BatchFlowAck is used for flow control when fast batch publishing into a stream.
 type BatchFlowAck struct {
-	// LastSequence is the previously highest sequence seen, this is set when a gap is detected
+	// LastSequence is the previously highest sequence seen, this is set when a gap is detected with "gap: ok".
 	LastSequence uint64 `json:"last_seq,omitempty"`
-	// CurrentSequence is the sequence of the message that triggered the ack
+	// CurrentSequence is the sequence of the message that triggered the ack.
+	// If "gap: fail" this means the messages up to CurrentSequence were persisted.
 	CurrentSequence uint64 `json:"seq,omitempty"`
-	// FlowSequence is the sequence of when AckMessages was last updated.
-	// A change in AckMessages will be represented by a change in this sequence.
-	FlowSequence uint64 `json:"flow_seq,omitempty"`
-	// AckMessages indicates the active per-message frequency of Flow Acks
+	// AckMessages indicates acknowledgements will be sent every N messages.
 	AckMessages uint64 `json:"ack_msgs,omitempty"`
 }
 
@@ -4996,13 +4994,6 @@ const (
 	FastBatchOpCommitEob
 )
 
-var seq uint64
-//var b = FastBatch{
-//	id: "id",
-//	flow: 500,
-//	gapOk: false,
-//}
-
 var fastBatchPool sync.Pool
 
 func getFastBatchFromPool() *FastBatch {
@@ -5030,16 +5021,6 @@ func getFastBatch(reply string) (*FastBatch, bool) {
 		return nil, false
 	}
 
-	//var b = FastBatch{}
-	//b.id = "batch"
-	//b.flow = 500
-	//b.seq = seq / 2 + 1
-	//seq++
-	//if b.seq == 2_000_000 {
-	//	b.commit = true
-	//}
-	//return &b, true
-
 	b := getFastBatchFromPool()
 
 	n := lreply - 4 // Move to just before the dot
@@ -5061,7 +5042,7 @@ func getFastBatch(reply string) (*FastBatch, bool) {
 	if o = strings.LastIndexByte(reply[:o], '.'); o == -1 {
 		return nil, true
 	} else {
-		a := parseInt64(stringToBytes(reply[o+1:p]))
+		a := parseInt64(stringToBytes(reply[o+1 : p]))
 		if a < 1 {
 			return nil, true
 		}
@@ -5091,7 +5072,7 @@ func getFastBatch(reply string) (*FastBatch, bool) {
 	if o = strings.LastIndexByte(reply[:o], '.'); o == -1 {
 		return nil, true
 	} else {
-		a := parseInt64(stringToBytes(reply[o+1:p]))
+		a := parseInt64(stringToBytes(reply[o+1 : p]))
 		if a <= 0 {
 			a = 10
 		}
@@ -5105,12 +5086,6 @@ func getFastBatch(reply string) (*FastBatch, bool) {
 		b.id = reply[o+1 : p]
 	}
 
-	//b.seq = seq / 2 + 1
-	//b.seq = seq + 1
-	//seq++
-	//if b.seq == 5_000_000 {
-	//	b.commit = true
-	//}
 	return b, false
 }
 
@@ -6916,10 +6891,9 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 		return err
 	}
 
-	_ = allowBatchPublish
-	//if !allowBatchPublish {
-	//	return respondError(NewJSBatchPublishDisabledError())
-	//}
+	if !allowBatchPublish {
+		return respondError(NewJSBatchPublishDisabledError())
+	}
 
 	if batch == nil {
 		return respondError(NewJSBatchPublishInvalidPatternError())
@@ -7007,7 +6981,7 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 	batches.mu.Unlock()
 
 	// The first message in the batch responds with the settings used for flow control.
-	if batch.seq == 1 && canRespond {
+	if batch.seq == 1 && canRespond && !batch.commit {
 		buf, _ := json.Marshal(&BatchFlowAck{AckMessages: b.ackMessages})
 		outq.sendMsg(reply, buf)
 	}

@@ -45,12 +45,13 @@ type batchGroup struct {
 	// Used for atomic batch publish.
 	store StreamStore // Where the batch is staged before committing.
 	// Used for fast batch publish.
-	pseq        uint64 // Last persisted batch sequence.
-	sseq        uint64 // Last persisted stream sequence.
-	fseq        uint64 // Sequence that the flow is based on. Updates to a new sequence when ackMessages gets updated.
-	ackMessages uint64 // Ack will be sent every N messages.
-	gapOk       bool   // Whether a gap is okay, if not the batch would be rejected.
-	reply       string // If the batch is committed, this is the reply subject used for the PubAck.
+	pseq           uint64 // Last persisted batch sequence.
+	sseq           uint64 // Last persisted stream sequence.
+	fseq           uint64 // Sequence that the flow is based on. Updates to a new sequence when ackMessages gets updated.
+	ackMessages    uint64 // Ack will be sent every N messages.
+	maxAckMessages uint64 // Maximum ackMessages value the client allows.
+	gapOk          bool   // Whether a gap is okay, if not the batch would be rejected.
+	reply          string // If the batch is committed, this is the reply subject used for the PubAck.
 }
 
 // newAtomicBatchGroup creates an atomic batch publish group.
@@ -67,9 +68,15 @@ func (batches *batching) newAtomicBatchGroup(mset *stream, batchId string) (*bat
 
 // newFastBatchGroup creates a fast batch publish group.
 // Lock should be held.
-func (batches *batching) newFastBatchGroup(mset *stream, batchId string, gapOk bool, ackMessages uint64) *batchGroup {
-	//b := &batchGroup{gapOk: gapOk, ackMessages: ackMessages}
-	b := &batchGroup{gapOk: gapOk, ackMessages: 1}
+func (batches *batching) newFastBatchGroup(mset *stream, batchId string, gapOk bool, maxAckMessages uint64) *batchGroup {
+	// If it's the first batch, just allow what the client wants, otherwise we'll
+	// need to coordinate and slowly ramp up this publisher.
+	// TODO(mvv): fast ingest's initial flow value improvements?
+	ackMessages := maxAckMessages
+	if len(batches.fast) > 1 {
+		ackMessages = 1
+	}
+	b := &batchGroup{gapOk: gapOk, ackMessages: ackMessages, maxAckMessages: maxAckMessages}
 	b.setupCleanupTimer(mset, batchId, batches)
 	return b
 }
@@ -141,9 +148,17 @@ func (batches *batching) fastBatchRegisterSequences(batchId string, batchSeq, st
 
 		// Check if we should allow ramping up or slowing down the flow of messages.
 		if flowRespond {
+			// TODO(mvv): fast ingest's dynamic flow value improvements?
+			//  This is currently just a simple value to have a working version. Should take average
+			//  message sizes into account and compare how much this client is contributing to the
+			//  ingest IPQ total size and messages and have publishers share based on that.
 			maxAckMessages := uint64(500 / len(batches.fast))
 			if maxAckMessages < 1 {
 				maxAckMessages = 1
+			}
+			// Limit to the client's allowed maximum.
+			if maxAckMessages > b.maxAckMessages {
+				maxAckMessages = b.maxAckMessages
 			}
 
 			if b.ackMessages < maxAckMessages {
@@ -173,11 +188,7 @@ func (b *batchGroup) fastBatchFlowControl(batchSeq uint64, mset *stream, reply s
 	if len(reply) == 0 {
 		return
 	}
-	response, _ := json.Marshal(&BatchFlowAck{
-		CurrentSequence: batchSeq,
-		FlowSequence:    b.fseq,
-		AckMessages:     b.ackMessages,
-	})
+	response, _ := json.Marshal(&BatchFlowAck{CurrentSequence: batchSeq, AckMessages: b.ackMessages})
 	mset.outq.sendMsg(reply, response)
 }
 
