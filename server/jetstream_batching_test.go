@@ -3440,7 +3440,10 @@ func TestJetStreamFastBatchPublishDuplicates(t *testing.T) {
 			require_Equal(t, pubAck.Error.Error(), NewJSStreamDuplicateMessageConflictError().Error())
 		}
 		mset.mu.RLock()
+		batches := mset.batches
+		batches.mu.Lock()
 		fastBatches := len(mset.batches.fast)
+		batches.mu.Unlock()
 		mset.mu.RUnlock()
 		require_Len(t, fastBatches, 0)
 
@@ -3494,7 +3497,10 @@ func TestJetStreamFastBatchPublishDuplicates(t *testing.T) {
 			require_Equal(t, pubAck.Error.Error(), NewJSStreamDuplicateMessageConflictError().Error())
 		}
 		mset.mu.RLock()
+		batches = mset.batches
+		batches.mu.Lock()
 		fastBatches = len(mset.batches.fast)
+		batches.mu.Unlock()
 		mset.mu.RUnlock()
 		require_Len(t, fastBatches, 0)
 	}
