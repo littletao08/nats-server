@@ -9288,11 +9288,10 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint
 	var tombs []msgId
 	var lowSeq uint64
 
-	fs.mu.Lock()
-	if fs.closed {
-		fs.mu.Unlock()
+	if fs.isClosed() {
 		return purged, ErrStoreClosed
 	}
+	fs.mu.Lock()
 	// Always return previous write errors.
 	if err := fs.werr; err != nil {
 		fs.mu.Unlock()
@@ -9704,6 +9703,9 @@ func (fs *fileStore) Compact(seq uint64) (uint64, error) {
 }
 
 func (fs *fileStore) compact(seq uint64) (uint64, error) {
+	if fs.isClosed() {
+		return 0, ErrStoreClosed
+	}
 	if seq == 0 {
 		return fs.purge(seq)
 	}
@@ -9711,10 +9713,6 @@ func (fs *fileStore) compact(seq uint64) (uint64, error) {
 	var purged, bytes uint64
 
 	fs.mu.Lock()
-	if fs.closed {
-		fs.mu.Unlock()
-		return 0, ErrStoreClosed
-	}
 	// Always return previous write errors.
 	if err := fs.werr; err != nil {
 		fs.mu.Unlock()
@@ -10741,7 +10739,7 @@ func (fs *fileStore) resetGlobalPerSubjectInfo() error {
 	// Clear any global subject state.
 	fs.psim, fs.tsl = fs.psim.Empty(), 0
 	if fs.noTrackSubjects() {
-		return
+		return nil
 	}
 	for _, mb := range fs.blks {
 		if err := fs.populateGlobalPerSubjectInfo(mb); err != nil {
@@ -11781,6 +11779,10 @@ func (fs *fileStore) deleteMap() (dmap avl.SequenceSet) {
 // SyncDeleted will make sure this stream has same deleted state as dbs.
 // This will only process deleted state within our current state.
 func (fs *fileStore) SyncDeleted(dbs DeleteBlocks) error {
+	if fs.isClosed() {
+		return ErrStoreClosed
+	}
+
 	if len(dbs) == 0 {
 		return nil
 	}
@@ -11788,9 +11790,6 @@ func (fs *fileStore) SyncDeleted(dbs DeleteBlocks) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	if fs.closed {
-		return ErrStoreClosed
-	}
 	// Always return previous write errors.
 	if err := fs.werr; err != nil {
 		return err
