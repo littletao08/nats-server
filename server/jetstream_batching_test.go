@@ -3588,6 +3588,67 @@ func TestJetStreamFastBatchPublishDuplicatesCluster(t *testing.T) {
 	require_Equal(t, pubAck.BatchSize, 9)
 }
 
+func TestJetStreamFastBatchPublishDuplicatesEobCommit(t *testing.T) {
+	test := func(t *testing.T, replicas int) {
+		c := createJetStreamClusterExplicit(t, "R3S", 3)
+		defer c.shutdown()
+
+		nc := clientConnectToServer(t, c.randomServer())
+		defer nc.Close()
+
+		var batchFlowAck BatchFlowAck
+		var pubAck JSPubAckResponse
+
+		_, err := jsStreamCreate(t, nc, &StreamConfig{
+			Name:              "TEST",
+			Subjects:          []string{"foo"},
+			Storage:           FileStorage,
+			Replicas:          replicas,
+			AllowBatchPublish: true,
+		})
+		require_NoError(t, err)
+
+		inbox := nats.NewInbox()
+		sub, err := nc.SubscribeSync(fmt.Sprintf("%s.>", inbox))
+		require_NoError(t, err)
+		defer sub.Drain()
+
+		msgId := "msgId"
+		m := nats.NewMsg("foo")
+		m.Header.Set(JSMsgId, msgId)
+		for seq := uint64(1); seq <= 2; seq++ {
+			if seq == 1 {
+				m.Reply = generateFastBatchReply(inbox, "uuid", seq, 0, FastBatchGapFail, FastBatchOpStart)
+			} else {
+				m.Reply = generateFastBatchReply(inbox, "uuid", seq, 0, FastBatchGapFail, FastBatchOpAppend)
+			}
+			require_NoError(t, nc.PublishMsg(m))
+		}
+		rmsg, err := sub.NextMsg(time.Second)
+		require_NoError(t, err)
+		batchFlowAck = BatchFlowAck{}
+		require_NoError(t, json.Unmarshal(rmsg.Data, &batchFlowAck))
+		require_Equal(t, batchFlowAck.AckMessages, 10)
+
+		m.Reply = generateFastBatchReply(inbox, "uuid", 3, 0, FastBatchGapFail, FastBatchOpCommitEob)
+		require_NoError(t, nc.PublishMsg(m))
+		rmsg, err = sub.NextMsg(time.Second)
+		require_NoError(t, err)
+		pubAck = JSPubAckResponse{}
+		require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+		require_True(t, pubAck.Error == nil)
+		require_Equal(t, pubAck.Sequence, 1)
+		require_Equal(t, pubAck.BatchId, "uuid")
+		require_Equal(t, pubAck.BatchSize, 2)
+	}
+
+	for _, replicas := range []int{1, 3} {
+		t.Run(fmt.Sprintf("R%d", replicas), func(t *testing.T) {
+			test(t, replicas)
+		})
+	}
+}
+
 func TestJetStreamFastBatchPublishHeaderCheckError(t *testing.T) {
 	test := func(t *testing.T, replicas int) {
 		c := createJetStreamClusterExplicit(t, "R3S", 3)

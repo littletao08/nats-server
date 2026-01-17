@@ -185,7 +185,9 @@ func (batches *batching) fastBatchRegisterSequences(mset *stream, reply string, 
 		// Store last persisted batch sequence.
 		// If we have no remaining pending writes, we might have had duplicate messages
 		// and need to send additional flow control messages.
+		var skipped bool
 		if b.pending == 0 {
+			skipped = true
 			b.pseq = b.lseq
 		} else {
 			b.pseq = batchSeq
@@ -199,6 +201,17 @@ func (batches *batching) fastBatchRegisterSequences(mset *stream, reply string, 
 					mset.outq.sendMsg(reply, err)
 				}
 				delete(batches.err, batchId)
+				return false
+			}
+			// If we skipped ahead due to duplicate messages, send the PubAck with the highest sequence.
+			if skipped {
+				var buf [256]byte
+				pubAck := append(buf[:0], mset.pubAck...)
+				response := append(pubAck, strconv.FormatUint(b.sseq, 10)...)
+				response = append(response, fmt.Sprintf(",\"batch\":%q,\"count\":%d}", batchId, b.lseq)...)
+				if len(reply) > 0 {
+					mset.outq.sendMsg(reply, response)
+				}
 				return false
 			}
 			return true
