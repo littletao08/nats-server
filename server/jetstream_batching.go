@@ -71,42 +71,42 @@ func (batches *batching) newAtomicBatch(mset *stream, batchId string) (*atomicBa
 }
 
 // setupCleanupTimer sets up a timer to clean up the batch after a timeout.
-func (ab *atomicBatch) setupCleanupTimer(mset *stream, batchId string, batches *batching) {
+func (b *atomicBatch) setupCleanupTimer(mset *stream, batchId string, batches *batching) {
 	// Create a timer to clean up after timeout.
 	timeout := getCleanupTimeout(mset)
-	ab.timer = time.AfterFunc(timeout, func() {
-		ab.cleanup(batchId, batches)
+	b.timer = time.AfterFunc(timeout, func() {
+		b.cleanup(batchId, batches)
 		mset.sendStreamBatchAbandonedAdvisory(batchId, BatchTimeout)
 	})
 }
 
 // resetCleanupTimer resets the cleanup timer, allowing to extend the lifetime of the batch.
 // Returns whether the timer was reset without it having expired before.
-func (ab *atomicBatch) resetCleanupTimer(mset *stream) bool {
+func (b *atomicBatch) resetCleanupTimer(mset *stream) bool {
 	timeout := getCleanupTimeout(mset)
-	return ab.timer.Reset(timeout)
+	return b.timer.Reset(timeout)
 }
 
 // cleanup deletes underlying resources associated with the batch and unregisters it from the stream's batches.
-func (ab *atomicBatch) cleanup(batchId string, batches *batching) {
+func (b *atomicBatch) cleanup(batchId string, batches *batching) {
 	batches.mu.Lock()
 	defer batches.mu.Unlock()
-	ab.cleanupLocked(batchId, batches)
+	b.cleanupLocked(batchId, batches)
 }
 
 // Lock should be held.
-func (ab *atomicBatch) cleanupLocked(batchId string, batches *batching) {
+func (b *atomicBatch) cleanupLocked(batchId string, batches *batching) {
 	globalInflightBatches.Add(-1)
-	ab.timer.Stop()
-	ab.store.Delete(true)
+	b.timer.Stop()
+	b.store.Delete(true)
 	delete(batches.atomic, batchId)
 }
 
 // Lock should be held.
-func (ab *atomicBatch) stopLocked() {
+func (b *atomicBatch) stopLocked() {
 	globalInflightBatches.Add(-1)
-	ab.timer.Stop()
-	ab.store.Stop()
+	b.timer.Stop()
+	b.store.Stop()
 }
 
 func getBatchStoreDir(mset *stream, batchId string) (string, string) {
@@ -147,11 +147,11 @@ func newBatchStore(mset *stream, batchId string) (StreamStore, error) {
 // If the timer has already cleaned up the batch, we can't commit.
 // Otherwise, we ensure the timer does not clean up the batch in the meantime.
 // Lock should be held.
-func (ab *atomicBatch) readyForCommit() bool {
-	if !ab.timer.Stop() {
+func (b *atomicBatch) readyForCommit() bool {
+	if !b.timer.Stop() {
 		return false
 	}
-	ab.store.FlushAllPending()
+	b.store.FlushAllPending()
 	return true
 }
 
@@ -202,12 +202,12 @@ func (batches *batching) fastBatchRegisterSequences(mset *stream, reply string, 
 // checkFlowControl checks whether a flow control message should be sent.
 // If so, it updates the flow values to speed up or slow down the publisher if needed.
 // Lock should be held.
-func (fb *fastBatch) checkFlowControl(mset *stream, reply string, batches *batching) {
-	am := uint64(fb.ackMessages)
-	if fb.pseq >= fb.fseq+am {
+func (b *fastBatch) checkFlowControl(mset *stream, reply string, batches *batching) {
+	am := uint64(b.ackMessages)
+	if b.pseq >= b.fseq+am {
 		// Instead of sending multiple flow control messages, skip ahead to only send the last.
-		steps := (fb.pseq - fb.fseq) / am
-		fb.fseq += steps * am
+		steps := (b.pseq - b.fseq) / am
+		b.fseq += steps * am
 
 		// TODO(mvv): fast ingest's dynamic flow value improvements?
 		//  This is currently just a simple value to have a working version. Should take average
@@ -218,36 +218,36 @@ func (fb *fastBatch) checkFlowControl(mset *stream, reply string, batches *batch
 			maxAckMessages = 1
 		}
 		// Limit to the client's allowed maximum.
-		if maxAckMessages > fb.maxAckMessages {
-			maxAckMessages = fb.maxAckMessages
+		if maxAckMessages > b.maxAckMessages {
+			maxAckMessages = b.maxAckMessages
 		}
 
-		if fb.ackMessages < maxAckMessages {
+		if b.ackMessages < maxAckMessages {
 			// Ramp up.
-			fb.ackMessages *= 2
-			if fb.ackMessages > maxAckMessages {
-				fb.ackMessages = maxAckMessages
+			b.ackMessages *= 2
+			if b.ackMessages > maxAckMessages {
+				b.ackMessages = maxAckMessages
 			}
-		} else if fb.ackMessages > maxAckMessages {
+		} else if b.ackMessages > maxAckMessages {
 			// Slow down.
-			fb.ackMessages /= 2
-			if fb.ackMessages <= maxAckMessages {
-				fb.ackMessages = maxAckMessages
+			b.ackMessages /= 2
+			if b.ackMessages <= maxAckMessages {
+				b.ackMessages = maxAckMessages
 			}
 		}
 
 		// Finally, send the flow control message.
-		fb.sendFlowControl(fb.fseq, mset, reply)
+		b.sendFlowControl(b.fseq, mset, reply)
 	}
 }
 
 // sendFlowControl sends a fast batch flow control message for the current highest sequence.
 // Lock should be held.
-func (fb *fastBatch) sendFlowControl(batchSeq uint64, mset *stream, reply string) {
+func (b *fastBatch) sendFlowControl(batchSeq uint64, mset *stream, reply string) {
 	if len(reply) == 0 {
 		return
 	}
-	response, _ := json.Marshal(&BatchFlowAck{CurrentSequence: batchSeq, AckMessages: fb.ackMessages})
+	response, _ := json.Marshal(&BatchFlowAck{CurrentSequence: batchSeq, AckMessages: b.ackMessages})
 	mset.outq.sendMsg(reply, response)
 }
 
@@ -276,32 +276,32 @@ func (batches *batching) fastBatchCommit(fb *fastBatch, batchId string, mset *st
 }
 
 // setupCleanupTimer sets up a timer to clean up the batch after a timeout.
-func (fb *fastBatch) setupCleanupTimer(mset *stream, batchId string, batches *batching) {
+func (b *fastBatch) setupCleanupTimer(mset *stream, batchId string, batches *batching) {
 	// Create a timer to clean up after timeout.
 	timeout := getCleanupTimeout(mset)
-	fb.timer = time.AfterFunc(timeout, func() {
-		fb.cleanup(batchId, batches)
+	b.timer = time.AfterFunc(timeout, func() {
+		b.cleanup(batchId, batches)
 		mset.sendStreamBatchAbandonedAdvisory(batchId, BatchTimeout)
 	})
 }
 
 // resetCleanupTimer resets the cleanup timer, allowing to extend the lifetime of the batch.
 // Returns whether the timer was reset without it having expired before.
-func (fb *fastBatch) resetCleanupTimer(mset *stream) bool {
+func (b *fastBatch) resetCleanupTimer(mset *stream) bool {
 	timeout := getCleanupTimeout(mset)
-	return fb.timer.Reset(timeout)
+	return b.timer.Reset(timeout)
 }
 
 // cleanup deletes underlying resources associated with the batch and unregisters it from the stream's batches.
-func (fb *fastBatch) cleanup(batchId string, batches *batching) {
+func (b *fastBatch) cleanup(batchId string, batches *batching) {
 	batches.mu.Lock()
 	defer batches.mu.Unlock()
-	fb.cleanupLocked(batchId, batches)
+	b.cleanupLocked(batchId, batches)
 }
 
 // Lock should be held.
-func (fb *fastBatch) cleanupLocked(batchId string, batches *batching) {
-	fb.timer.Stop()
+func (b *fastBatch) cleanupLocked(batchId string, batches *batching) {
+	b.timer.Stop()
 	delete(batches.fast, batchId)
 }
 

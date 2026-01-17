@@ -2501,12 +2501,14 @@ func (mset *stream) updateWithAdvisory(config *StreamConfig, sendAdvisory bool, 
 		}
 	}
 
-	// If batch publish is disabled, delete any in-progress batches.
-	if !cfg.AllowAtomicPublish || !cfg.AllowBatchPublish {
-		mset.deleteInflightBatches(false)
-		if !cfg.AllowAtomicPublish {
-			mset.deleteBatchApplyState()
-		}
+	// If atomic publish is disabled, delete any in-progress batches.
+	if !cfg.AllowAtomicPublish {
+		mset.deleteAtomicBatches(false)
+		mset.deleteBatchApplyState()
+	}
+	// If fast batch publish is disabled, delete any in-progress batches.
+	if !cfg.AllowBatchPublish {
+		mset.deleteFastBatches()
 	}
 
 	// Now update config and store's version of our config.
@@ -4528,7 +4530,7 @@ func (mset *stream) unsubscribeToStream(stopping, shuttingDown bool) error {
 		mset.stopSourceConsumers()
 	}
 	// Clear batching state.
-	mset.deleteInflightBatches(shuttingDown)
+	mset.deleteAtomicBatches(shuttingDown)
 
 	if stopping {
 		// In case we had a direct get subscriptions.
@@ -4547,22 +4549,19 @@ func (mset *stream) unsubscribeToStream(stopping, shuttingDown bool) error {
 }
 
 // Lock should be held.
-func (mset *stream) deleteInflightBatches(shuttingDown bool) {
+func (mset *stream) deleteAtomicBatches(shuttingDown bool) {
 	if mset.batches != nil {
 		mset.batches.mu.Lock()
-		for batchId, ab := range mset.batches.atomic {
+		for batchId, b := range mset.batches.atomic {
 			// If shutting down, do fixup during startup. In-memory batches don't require manual cleanup.
 			if shuttingDown {
-				ab.stopLocked()
+				b.stopLocked()
 			} else {
-				ab.cleanupLocked(batchId, mset.batches)
+				b.cleanupLocked(batchId, mset.batches)
 			}
 		}
-		for batchId, fb := range mset.batches.fast {
-			fb.cleanupLocked(batchId, mset.batches)
-		}
+		mset.batches.atomic = nil
 		mset.batches.mu.Unlock()
-		mset.batches = nil
 	}
 }
 
@@ -4574,6 +4573,18 @@ func (mset *stream) deleteBatchApplyState() {
 			bce.ReturnToPool()
 		}
 		mset.batchApply = nil
+	}
+}
+
+// Lock should be held.
+func (mset *stream) deleteFastBatches() {
+	if mset.batches != nil {
+		mset.batches.mu.Lock()
+		for batchId, b := range mset.batches.fast {
+			b.cleanupLocked(batchId, mset.batches)
+		}
+		mset.batches.fast = nil
+		mset.batches.mu.Unlock()
 	}
 }
 
@@ -6965,6 +6976,7 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 	}
 
 	// The first message in the batch responds with the settings used for flow control.
+	// If committing immediately, we only send the pub ack.
 	if batch.seq == 1 && canRespond && !batch.commit {
 		buf, _ := json.Marshal(&BatchFlowAck{AckMessages: b.ackMessages})
 		outq.sendMsg(reply, buf)

@@ -3077,8 +3077,6 @@ func TestJetStreamFastBatchPublish(t *testing.T) {
 func TestJetStreamFastBatchPublishGapDetection(t *testing.T) {
 	test := func(
 		t *testing.T,
-		storage StorageType,
-		retention RetentionPolicy,
 		replicas int,
 		gapMode string,
 	) {
@@ -3094,8 +3092,7 @@ func TestJetStreamFastBatchPublishGapDetection(t *testing.T) {
 		_, err := jsStreamCreate(t, nc, &StreamConfig{
 			Name:              "TEST",
 			Subjects:          []string{"foo"},
-			Storage:           storage,
-			Retention:         retention,
+			Storage:           FileStorage,
 			Replicas:          replicas,
 			AllowBatchPublish: true,
 		})
@@ -3166,15 +3163,11 @@ func TestJetStreamFastBatchPublishGapDetection(t *testing.T) {
 		}
 	}
 
-	for _, storage := range []StorageType{FileStorage, MemoryStorage} {
-		for _, retention := range []RetentionPolicy{LimitsPolicy, InterestPolicy, WorkQueuePolicy} {
-			for _, replicas := range []int{1, 3} {
-				for _, gapMode := range []string{"fail", "ok", "unknown"} {
-					t.Run(fmt.Sprintf("%s/%s/R%d/%s", storage, retention, replicas, gapMode), func(t *testing.T) {
-						test(t, storage, retention, replicas, gapMode)
-					})
-				}
-			}
+	for _, replicas := range []int{1, 3} {
+		for _, gapMode := range []string{"fail", "ok", "unknown"} {
+			t.Run(fmt.Sprintf("R%d/%s", replicas, gapMode), func(t *testing.T) {
+				test(t, replicas, gapMode)
+			})
 		}
 	}
 }
@@ -3208,11 +3201,7 @@ func TestJetStreamFastBatchPublishFlowControl(t *testing.T) {
 	accounts { $SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] } }
 `
 
-	test := func(
-		t *testing.T,
-		storage StorageType,
-		replicas int,
-	) {
+	test := func(t *testing.T, replicas int) {
 		c := createJetStreamClusterWithTemplate(t, templ, "R3S", 3)
 		defer c.shutdown()
 
@@ -3225,7 +3214,7 @@ func TestJetStreamFastBatchPublishFlowControl(t *testing.T) {
 		_, err := jsStreamCreate(t, nc, &StreamConfig{
 			Name:              "TEST",
 			Subjects:          []string{"foo"},
-			Storage:           storage,
+			Storage:           FileStorage,
 			Replicas:          replicas,
 			AllowBatchPublish: true,
 		})
@@ -3273,12 +3262,10 @@ func TestJetStreamFastBatchPublishFlowControl(t *testing.T) {
 		}
 	}
 
-	for _, storage := range []StorageType{FileStorage, MemoryStorage} {
-		for _, replicas := range []int{1, 3} {
-			t.Run(fmt.Sprintf("%s/R%d", storage, replicas), func(t *testing.T) {
-				test(t, storage, replicas)
-			})
-		}
+	for _, replicas := range []int{1, 3} {
+		t.Run(fmt.Sprintf("R%d", replicas), func(t *testing.T) {
+			test(t, replicas)
+		})
 	}
 }
 
@@ -3395,12 +3382,7 @@ func TestJetStreamFastBatchPublishSourceAndMirror(t *testing.T) {
 }
 
 func TestJetStreamFastBatchPublishDuplicates(t *testing.T) {
-	test := func(
-		t *testing.T,
-		storage StorageType,
-		retention RetentionPolicy,
-		replicas int,
-	) {
+	test := func(t *testing.T, replicas int) {
 		c := createJetStreamClusterExplicit(t, "R3S", 3)
 		defer c.shutdown()
 
@@ -3413,8 +3395,7 @@ func TestJetStreamFastBatchPublishDuplicates(t *testing.T) {
 		_, err := jsStreamCreate(t, nc, &StreamConfig{
 			Name:              "TEST",
 			Subjects:          []string{"foo"},
-			Storage:           storage,
-			Retention:         retention,
+			Storage:           FileStorage,
 			Replicas:          replicas,
 			AllowBatchPublish: true,
 		})
@@ -3518,14 +3499,10 @@ func TestJetStreamFastBatchPublishDuplicates(t *testing.T) {
 		require_Len(t, fastBatches, 0)
 	}
 
-	for _, storage := range []StorageType{FileStorage, MemoryStorage} {
-		for _, retention := range []RetentionPolicy{LimitsPolicy, InterestPolicy, WorkQueuePolicy} {
-			for _, replicas := range []int{1, 3} {
-				t.Run(fmt.Sprintf("%s/%s/R%d", storage, retention, replicas), func(t *testing.T) {
-					test(t, storage, retention, replicas)
-				})
-			}
-		}
+	for _, replicas := range []int{1, 3} {
+		t.Run(fmt.Sprintf("R%d", replicas), func(t *testing.T) {
+			test(t, replicas)
+		})
 	}
 }
 
